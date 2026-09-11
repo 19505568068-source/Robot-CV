@@ -211,3 +211,22 @@ button, a { -webkit-tap-highlight-color: transparent; }
 @media (prefers-reduced-motion: reduce) {
   .spinner { animation: none; }
 }
+
+.conversation-guide { margin-bottom: 24px; padding: 18px; background: #fff; border: 1px solid #dce3df; border-radius: 12px; overflow-wrap: anywhere; }
+.guide-step { margin: 22px 0 10px; color: #16794c; font-size: 12px; font-weight: 750; }
+.guide-step:first-child { margin-top: 0; }
+.guide-copy { margin: 8px 0; white-space: pre-wrap; font-size: 15px; line-height: 1.7; }
+.guide-resume { display: inline-flex; min-height: 44px; align-items: center; margin-top: 6px; padding: 8px 14px; color: #166542; background: #edf8f1; border-radius: 7px; font-weight: 700; text-decoration: none; }
+.experience-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 14px 0; }
+.experience-card { min-height: 88px; padding: 14px; text-align: left; color: #18201d; background: #f8faf9; border: 1px solid #dce3df; border-radius: 9px; cursor: pointer; overflow-wrap: anywhere; }
+.experience-card:hover { border-color: #16794c; }
+.experience-card[aria-pressed="true"] { border-color: #16794c; background: #edf8f1; }
+.experience-card:focus-visible, .guide-resume:focus-visible { outline: 3px solid #16794c; outline-offset: 3px; }
+.experience-kind { margin: 0 0 6px; color: #64736b; font-size: 12px; }
+.experience-title { margin: 0; font-size: 15px; line-height: 1.5; font-weight: 700; }
+.experience-detail { padding: 16px; background: #f5f9f6; border-radius: 9px; }
+.experience-detail h2 { margin: 0 0 12px; font-size: 18px; line-height: 1.5; }
+.experience-detail ul { padding-left: 22px; line-height: 1.7; font-size: 15px; }
+.experience-detail li + li { margin-top: 6px; }
+.question-invitation { margin: 16px 0 0; padding-top: 12px; border-top: 1px solid #d4e4d9; color: #166542; font-size: 15px; line-height: 1.7; }
+@media (max-width: 420px) { .experience-cards { grid-template-columns: 1fr; } .conversation-guide { padding: 14px; } }

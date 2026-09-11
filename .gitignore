@@ -6,3 +6,7 @@ hr-web.json
 hr-ai.json
 hr-materials/
 hr-codex-runtime/
+
+# macOS metadata
+._*
+.DS_Store
