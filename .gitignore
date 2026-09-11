@@ -1,0 +1,8 @@
+node_modules/
+.env*
+*.log
+hr.json
+hr-web.json
+hr-ai.json
+hr-materials/
+hr-codex-runtime/

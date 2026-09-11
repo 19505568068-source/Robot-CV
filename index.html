@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f5f7f6">
+  <title>候选人 AI 助理</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <main class="chat-shell">
+    <header class="chat-header">
+      <div class="identity-mark" aria-hidden="true">AI</div>
+      <div class="identity-copy">
+        <strong id="candidateName">候选人 AI 助理</strong>
+        <span><i class="status-dot" aria-hidden="true"></i><span id="connectionState">正在连接</span></span>
+      </div>
+      <a class="resume-link" id="resumeLink" href="/api/public/session/resume" hidden>
+        <span aria-hidden="true">↓</span><span>简历</span>
+      </a>
+    </header>
+
+    <section class="messages" id="messages" aria-live="polite" aria-label="聊天记录">
+      <div class="loading-state" id="loadingState">
+        <span class="spinner" aria-hidden="true"></span>
+        <span>正在进入会话</span>
+      </div>
+    </section>
+
+    <section class="consent-panel" id="consentPanel" hidden aria-labelledby="consentTitle">
+      <div class="consent-inner">
+        <span class="consent-label">开始前确认</span>
+        <h1 id="consentTitle">与候选人的 AI 助理沟通</h1>
+        <p id="disclosure"></p>
+        <div class="consent-actions">
+          <button class="primary-action" id="acceptConsent" type="button">同意并开始沟通</button>
+          <button class="text-action" id="declineConsent" type="button">暂不同意</button>
+        </div>
+        <p class="consent-error" id="consentError" role="alert"></p>
+      </div>
+    </section>
+
+    <form class="composer" id="composer">
+      <label class="sr-only" for="messageInput">输入消息</label>
+      <textarea id="messageInput" rows="1" maxlength="6000" placeholder="向候选人提问" disabled></textarea>
+      <button id="sendButton" type="submit" aria-label="发送消息" title="发送" disabled>
+        <span aria-hidden="true">↑</span>
+      </button>
+    </form>
+  </main>
+
+  <div class="fatal-state" id="fatalState" hidden role="alert">
+    <strong>暂时无法进入会话</strong>
+    <p id="fatalMessage">链接可能已更新，请向候选人获取新的二维码。</p>
+  </div>
+</body>
+</html>
