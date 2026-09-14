@@ -8,6 +8,7 @@ import type { SecretProtector } from "../src/security/dpapi.js";
 import type { HrAiService } from "../src/server/hr-ai-service.js";
 import { HrWebChatPublicError } from "../src/server/hr-web-chat-server.js";
 import { HrWebChatService } from "../src/server/hr-web-chat-service.js";
+import { listHrWebProjectCards } from "../src/server/hr-project-catalog.js";
 import { HrStore } from "../src/state/hr.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 
@@ -59,6 +60,15 @@ test("connects a consented H5 visitor to the existing archive, resume and opport
   assert.equal(accepted.consentStatus, "accepted");
   assert.equal(accepted.resumeAvailable, true);
   assert.equal((await service.getResume({ ...context, visitorId: accepted.visitorId })).name, "candidate.pdf");
+  const opening = await service.listMessages(
+    { ...context, visitorId: accepted.visitorId },
+    { limit: 100 }
+  );
+  assert.deepEqual(opening.messages.map((message) => message.role), ["assistant", "assistant", "assistant"]);
+  assert.match(opening.messages[0]!.text, /企业 AI 产品经验/u);
+  assert.match(opening.messages[1]!.text, /candidate\.pdf/u);
+  assert.match(opening.messages[2]!.text, /哪家公司/u);
+  assert.equal(opening.projectOptions, undefined);
 
   const result = await service.submitMessage(
     { ...context, visitorId: accepted.visitorId },
@@ -72,7 +82,7 @@ test("connects a consented H5 visitor to the existing archive, resume and opport
     { limit: 100 }
   );
   assert.deepEqual(beforeReply.messages.map((message) => message.role), ["assistant", "assistant", "assistant", "visitor", "assistant"]);
-  assert.equal(beforeReply.projectOptions?.length, 6);
+  assert.equal(beforeReply.projectOptions?.length, listHrWebProjectCards().length);
   assert.match(beforeReply.messages.at(-1)!.text, /项目与实习经历/u);
   assert.equal(beforeReply.messages.at(-1)!.kind, "project-menu");
   releaseReply();
@@ -89,32 +99,45 @@ test("connects a consented H5 visitor to the existing archive, resume and opport
   assert.match(page.messages[4]!.text, /项目与实习经历/u);
   assert.equal(page.messages[4]!.kind, "project-menu");
   assert.match(page.messages[5]!.text, /工作地点/u);
-  assert.equal((await service.listMessages({ ...context, visitorId: accepted.visitorId }, { limit: 100 })).projectOptions?.length, 6);
+  assert.equal(
+    (await service.listMessages({ ...context, visitorId: accepted.visitorId }, { limit: 100 })).projectOptions?.length,
+    listHrWebProjectCards().length
+  );
   assert.equal(store.listOpportunities()[0]?.company, "星河科技");
   assert.equal(store.listOpportunities()[0]?.role, "AI 产品经理");
 
+  const visitor = store.getVisitor(accepted.visitorId!);
+  assert.ok(visitor);
+  await store.archiveOutbound({
+    channelMessageId: `web:project:${visitor.id}:red-infinity`,
+    openKfid: "wechat-h5-hr-clawbot",
+    externalUserId: visitor.externalUserId,
+    text: "旧版项目详情",
+    messageType: "project-detail"
+  });
   const project = await service.selectProject(
     { ...context, visitorId: accepted.visitorId },
     { projectId: "red-infinity" }
   );
   assert.equal(project.project.id, "red-infinity");
   assert.match(project.message.text, /我的角色：游戏策划/u);
-  assert.match(project.message.text, /欢迎直接从这段经历开始提问/u);
+  assert.match(project.message.text, /具体工作：/u);
+  assert.match(project.message.text, /请从这段经历开始提问/u);
   const afterProject = store.listMessagesForVisitor(accepted.visitorId!);
-  assert.equal(afterProject.filter((message) => message.messageType === "project-detail").length, 1);
+  assert.equal(afterProject.filter((message) => message.messageType === "project-detail").length, 2);
   const duplicateProject = await service.selectProject(
     { ...context, visitorId: accepted.visitorId },
     { projectId: "red-infinity" }
   );
   assert.equal(duplicateProject.message.id, project.message.id);
-  assert.equal(store.listMessagesForVisitor(accepted.visitorId!).filter((message) => message.messageType === "project-detail").length, 1);
+  assert.equal(store.listMessagesForVisitor(accepted.visitorId!).filter((message) => message.messageType === "project-detail").length, 2);
 
   const duplicate = await service.submitMessage(
     { ...context, visitorId: accepted.visitorId },
     { clientMessageId: "deec3d0f-501d-4599-94ab-459a164bb0eb", text: "重复提交" }
   );
   assert.equal(duplicate.replyStatus, "sent");
-  assert.equal((await service.listMessages({ ...context, visitorId: accepted.visitorId }, { limit: 100 })).messages.length, 7);
+  assert.equal((await service.listMessages({ ...context, visitorId: accepted.visitorId }, { limit: 100 })).messages.length, 8);
 });
 
 test("applies the commitment guard to Codex replies on the H5 primary path", async (t) => {

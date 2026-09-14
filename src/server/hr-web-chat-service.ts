@@ -30,6 +30,7 @@ import {
 } from "./hr-project-catalog.js";
 
 const WEB_ENTRY_ID = "wechat-h5-hr-clawbot";
+const PROJECT_CATALOG_REVISION = "2026-09-14";
 const DEFAULT_INTRODUCTION = "您好，我是候选人的 AI 招聘助理 ClawBot。您可以直接询问候选人的经历、项目与求职意向；涉及面试时间、薪资、Offer 或入职安排时，我会交由候选人本人确认。";
 const COMPANY_PROMPT = "为了按岗位重点沟通，方便先告诉我您来自哪家公司吗？";
 const PROJECT_MENU_PROMPT = "收到，下面是几段可以重点交流的项目与实习经历。选择标题后，我会说明自己的角色、具体工作和结果，欢迎您直接开始提问。";
@@ -495,7 +496,7 @@ function projectMenuEventId(visitorId: string): string {
 }
 
 function projectEventId(visitorId: string, projectId: string): string {
-  return `web:project:${visitorId}:${projectId}`;
+  return `web:project:${visitorId}:${PROJECT_CATALOG_REVISION}:${projectId}`;
 }
 
 function card(project: ReturnType<typeof getHrWebProject>): HrWebProjectCard {

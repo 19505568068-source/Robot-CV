@@ -1,6 +1,10 @@
 # Cloudflare deployment
 
-The repository contains the complete HR ClawBot source (frontend and Node.js backend). The `cloudflare-site/` directory is the visitor H5 static entry used by the Cloudflare deployment.
+The repository contains the HR ClawBot frontend and Node.js backend source. The `cloudflare-site/` directory is only the generated visitor H5 static entry used by Cloudflare.
+
+## Current status
+
+The local and same-LAN flow has been verified. No public HTTPS backend is currently configured. A Cloudflare static deployment is therefore not a working public HR ClawBot until same-origin `/api/public/*` requests reach the Node backend and the full flow is tested end to end.
 
 ## GitHub-connected deployment
 
@@ -8,10 +12,10 @@ In Cloudflare Workers & Pages, create a Git-connected Worker/Pages deployment fo
 
 - Repository: `19505568068-source/Robot-CV`
 - Production branch: `main`
-- Build command: leave empty for a static upload
+- Build command: `npm run build`
 - Static output directory: `cloudflare-site`
 
-The generated Cloudflare URL can serve the H5 shell. The browser still calls `/api/public/*`, which must be served by a reachable HR ClawBot backend.
+The build regenerates `cloudflare-site/` from `src/web-chat/`, including the project menu. Do not edit the generated directory directly. The generated Cloudflare URL can serve the H5 shell, but the browser still calls same-origin `/api/public/*`, which must be routed to a reachable HR ClawBot backend.
 
 ## Backend limitation
 
