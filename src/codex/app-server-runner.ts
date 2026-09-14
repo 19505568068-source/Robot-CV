@@ -1,0 +1,1127 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import path from "node:path";
+import readline from "node:readline";
+
+import { resolveCodexCommand, type CodexRunResult } from "./exec-runner.js";
+
+export type AppServerRunnerOptions = {
+  codexBin?: string;
+  requestTimeoutMs?: number;
+  interruptTimeoutMs?: number;
+  turnTimeoutMs?: number;
+  turnStallTimeoutMs?: number;
+  turnProbeTimeoutMs?: number;
+  streamCallbackTimeoutMs?: number;
+  processCwd?: string;
+  env?: NodeJS.ProcessEnv;
+  serverRequestPolicy?: "trusted" | "deny-all";
+  strictConfig?: boolean;
+  experimentalApi?: boolean;
+};
+
+export type CodexRestrictedReadOnlySandboxPolicy = {
+  type: "readOnly";
+  permissionProfile: string;
+  networkAccess: false;
+  access: {
+    type: "restricted";
+    includePlatformDefaults: false;
+    readableRoots: string[];
+  };
+};
+
+export type CodexOutputSchema = Record<string, unknown>;
+
+export type CodexRunnerInput = {
+  prompt: string;
+  cwd: string;
+  threadId?: string;
+  model?: string;
+  effort?: string;
+  sandboxPolicy?: CodexRestrictedReadOnlySandboxPolicy;
+  outputSchema?: CodexOutputSchema;
+  turnTimeoutMs?: number;
+  signal?: AbortSignal;
+  onThreadStarted?: (threadId: string) => Promise<void> | void;
+  onDelta?: (delta: string) => Promise<void> | void;
+  onProgress?: (message: string) => Promise<void> | void;
+};
+
+export type CodexHistoryMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  kind?: "progress";
+  createdAt?: string;
+};
+
+export type CodexRuntimeInfo = {
+  model?: string;
+  effort?: string;
+  provider?: string;
+};
+
+export type CodexModelOption = {
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  defaultEffort?: string;
+  supportedEfforts: Array<{
+    effort: string;
+    description: string;
+  }>;
+};
+
+type JsonRpcId = number | string;
+
+type PendingRequest = {
+  method: string;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer?: NodeJS.Timeout;
+};
+
+type TurnCompletion = {
+  status: string;
+  text: string;
+  raw: string;
+  error?: string;
+};
+
+type TurnWaiter = {
+  resolve: (value: CodexRunResult) => void;
+  reject: (error: Error) => void;
+};
+
+type TurnStream = {
+  onDelta?: (delta: string) => Promise<void> | void;
+  onProgress?: (message: string) => Promise<void> | void;
+  chain: Promise<void>;
+  progressChain: Promise<void>;
+  progressActive: boolean;
+  closed: boolean;
+};
+
+type TurnProbe = {
+  threadId: string;
+  turnId: string;
+  lastActivityAt: number;
+  probing: boolean;
+  timer?: NodeJS.Timeout;
+};
+
+type QueuedTurnEvent = {
+  type: "delta" | "progress";
+  text: string;
+};
+
+type WireMessage = {
+  id?: JsonRpcId;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: unknown;
+  error?: {
+    code?: number;
+    message?: string;
+    data?: unknown;
+  };
+};
+
+const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS = 45_000;
+
+export class AppServerCodexRunner {
+  private child?: ChildProcessWithoutNullStreams;
+  private lines?: readline.Interface;
+  private connectPromise?: Promise<void>;
+  private initialized = false;
+  private closed = false;
+  private nextId = 1;
+  private stderr = "";
+  private readonly pending = new Map<JsonRpcId, PendingRequest>();
+  private readonly activeTurns = new Map<string, string>();
+  private readonly turnWaiters = new Map<string, TurnWaiter>();
+  private readonly turnEvents = new Map<string, string[]>();
+  private readonly turnTexts = new Map<string, string>();
+  private readonly completedTurns = new Map<string, TurnCompletion>();
+  private readonly turnStreams = new Map<string, TurnStream>();
+  private readonly turnProbes = new Map<string, TurnProbe>();
+  private readonly queuedTurnEvents = new Map<string, QueuedTurnEvent[]>();
+  private readonly itemPhasesByTurn = new Map<string, Map<string, string>>();
+  private readonly abandonedTurns = new Set<string>();
+  private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
+  private modelOptions?: CodexModelOption[];
+
+  constructor(private readonly options: AppServerRunnerOptions = {}) {}
+
+  async run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    await this.ensureConnected();
+    const isolation = serializeIsolationPolicy(input.sandboxPolicy);
+
+    const threadResponse = await this.request(
+      input.threadId ? "thread/resume" : "thread/start",
+      compactObject({
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        cwd: input.cwd,
+        model: input.model,
+        approvalPolicy: "never",
+        ...(input.threadId ? isolation.threadResume : isolation.threadStart)
+      })
+    ) as Record<string, unknown>;
+    const thread = threadResponse.thread as Record<string, unknown> | undefined;
+    const threadId = typeof thread?.id === "string" ? thread.id : input.threadId;
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread id");
+    }
+    this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
+    await input.onThreadStarted?.(threadId);
+
+    const turnResponse = await this.request("turn/start", compactObject({
+      threadId,
+      input: [{ type: "text", text: input.prompt, text_elements: [] }],
+      cwd: input.cwd,
+      approvalPolicy: "never",
+      ...isolation.turn,
+      model: input.model,
+      effort: input.effort,
+      outputSchema: input.outputSchema
+    })) as Record<string, unknown>;
+    const startedTurn = turnResponse.turn as Record<string, unknown> | undefined;
+    const turnId = typeof startedTurn?.id === "string" ? startedTurn.id : undefined;
+    if (!turnId) {
+      throw new Error("Codex app-server did not return a turn id");
+    }
+
+    this.activeTurns.set(threadId, turnId);
+    this.beginTurnProbe(threadId, turnId);
+    if (input.onDelta || input.onProgress) {
+      const key = turnKey(threadId, turnId);
+      this.turnStreams.set(key, {
+        onDelta: input.onDelta,
+        onProgress: input.onProgress,
+        chain: Promise.resolve(),
+        progressChain: Promise.resolve(),
+        progressActive: false,
+        closed: false
+      });
+      for (const event of this.queuedTurnEvents.get(key) ?? []) {
+        this.enqueueTurnEvent(key, event);
+      }
+      this.queuedTurnEvents.delete(key);
+    }
+    const turn = this.waitForTurn(threadId, turnId);
+    return this.withTurnCancellation(
+      turn,
+      threadId,
+      turnId,
+      input.turnTimeoutMs ?? this.options.turnTimeoutMs,
+      input.signal
+    );
+  }
+
+  async listSessions(): Promise<unknown> {
+    await this.ensureConnected();
+    return this.request("thread/list", {});
+  }
+
+  async getHistory(threadId: string): Promise<CodexHistoryMessage[]> {
+    await this.ensureConnected();
+    const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
+    const thread = response.thread as Record<string, unknown> | undefined;
+    return parseThreadHistory(thread);
+  }
+
+  async getRuntimeInfo(cwd: string, threadId?: string): Promise<CodexRuntimeInfo> {
+    const active = threadId ? this.runtimeInfoByThread.get(threadId) : undefined;
+    if (active?.model || active?.effort) {
+      return active;
+    }
+    await this.ensureConnected();
+    const response = await this.request("config/read", { cwd, includeLayers: false }) as Record<string, unknown>;
+    const config = response.config as Record<string, unknown> | undefined;
+    return compactRuntimeInfo({
+      model: config?.model,
+      effort: config?.model_reasoning_effort,
+      provider: config?.model_provider ?? config?.modelProvider
+    });
+  }
+
+  async listModels(): Promise<CodexModelOption[]> {
+    if (this.modelOptions) {
+      return structuredClone(this.modelOptions);
+    }
+    await this.ensureConnected();
+    const models: CodexModelOption[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const response = await this.request("model/list", compactObject({
+        cursor,
+        includeHidden: false,
+        limit: 100
+      })) as Record<string, unknown>;
+      const data = Array.isArray(response.data) ? response.data : [];
+      for (const item of data) {
+        const option = parseModelOption(item);
+        if (option && !models.some((candidate) => candidate.model === option.model)) {
+          models.push(option);
+        }
+      }
+      const nextCursor = typeof response.nextCursor === "string" && response.nextCursor
+        ? response.nextCursor
+        : undefined;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    this.modelOptions = models;
+    return structuredClone(models);
+  }
+
+  async stop(threadId?: string): Promise<void> {
+    if (!this.initialized || !this.child || this.child.exitCode !== null) {
+      return;
+    }
+
+    const target = threadId && this.activeTurns.has(threadId)
+      ? { threadId, turnId: this.activeTurns.get(threadId) as string }
+      : Array.from(this.activeTurns.entries(), ([activeThreadId, turnId]) => ({
+        threadId: activeThreadId,
+        turnId
+      })).at(-1);
+    if (!target) {
+      return;
+    }
+
+    await this.interruptTurn(target.threadId, target.turnId);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.failTransport(new Error("Codex app-server runner closed"), true);
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.closed) {
+      throw new Error("Codex app-server runner is closed");
+    }
+    if (this.initialized && this.child?.exitCode === null && !this.child.stdin.destroyed) {
+      return;
+    }
+    if (!this.connectPromise) {
+      this.connectPromise = this.startAppServer().finally(() => {
+        this.connectPromise = undefined;
+      });
+    }
+    await this.connectPromise;
+  }
+
+  private async startAppServer(): Promise<void> {
+    const command = resolveCodexCommand(this.options.codexBin ?? "codex");
+    const child = spawn(command.command, [
+      ...command.argsPrefix,
+      "app-server",
+      "--stdio",
+      ...(this.options.strictConfig ? ["--strict-config"] : [])
+    ], {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
+      ...(this.options.processCwd ? { cwd: this.options.processCwd } : {}),
+      ...(this.options.env ? { env: this.options.env } : {})
+    });
+    this.child = child;
+    this.stderr = "";
+    this.lines = readline.createInterface({ input: child.stdout });
+    this.lines.on("line", (line) => this.handleMessage(line));
+    child.stderr.on("data", (chunk: Buffer) => {
+      this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-20_000);
+    });
+    child.once("error", (error) => this.handleChildFailure(child, error));
+    child.once("exit", (code, signal) => {
+      const detail = this.stderr.trim();
+      const suffix = detail ? `: ${detail}` : "";
+      this.handleChildFailure(
+        child,
+        new Error(`Codex app-server exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}${suffix}`)
+      );
+    });
+
+    try {
+      await this.request("initialize", {
+        clientInfo: {
+          name: "codex-weixin",
+          title: "Codex Weixin",
+          version: "0.2.0"
+        },
+        capabilities: {
+          experimentalApi: this.options.experimentalApi ?? false,
+          requestAttestation: false
+        }
+      }, 15_000);
+      this.notify("initialized", {});
+      this.initialized = true;
+    } catch (error) {
+      this.failTransport(error instanceof Error ? error : new Error(String(error)), true);
+      throw error;
+    }
+  }
+
+  private request(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
+  ): Promise<unknown> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+        const error = new Error(`app-server request ${method} timed out after ${timeoutMs}ms`);
+        this.pending.delete(id);
+        reject(error);
+        this.failTransport(error, true);
+      }, timeoutMs);
+      this.pending.set(id, { method, resolve, reject, timer });
+      try {
+        this.send({ id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  private notify(method: string, params: Record<string, unknown>): void {
+    this.send({ method, params });
+  }
+
+  private send(message: WireMessage): void {
+    if (!this.child || this.child.exitCode !== null || this.child.stdin.destroyed) {
+      throw new Error("Codex app-server stdio transport is not connected");
+    }
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private handleMessage(raw: string): void {
+    let message: WireMessage;
+    try {
+      message = JSON.parse(raw) as WireMessage;
+    } catch {
+      return;
+    }
+
+    if (message.method && message.id !== undefined) {
+      this.handleServerRequest(message);
+      return;
+    }
+    if (message.method) {
+      this.handleNotification(message.method, message.params ?? {}, raw);
+      return;
+    }
+    if (message.id === undefined) {
+      return;
+    }
+
+    const pending = this.pending.get(message.id);
+    if (!pending) {
+      return;
+    }
+    this.pending.delete(message.id);
+    clearTimeout(pending.timer);
+    if (message.error) {
+      const code = message.error.code === undefined ? "" : ` (${message.error.code})`;
+      pending.reject(new Error(`app-server ${pending.method} failed${code}: ${message.error.message ?? "unknown error"}`));
+    } else {
+      pending.resolve(message.result);
+    }
+  }
+
+  private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    const activityKey = turnKeyFromParams(params);
+    if (activityKey) {
+      this.touchTurnProbe(activityKey);
+    }
+    if (method === "item/started") {
+      const key = turnKeyFromParams(params);
+      const item = params.item as Record<string, unknown> | undefined;
+      const itemId = typeof item?.id === "string" ? item.id : undefined;
+      if (key && itemId && item?.type === "agentMessage" && typeof item.phase === "string") {
+        const phases = this.itemPhasesByTurn.get(key) ?? new Map<string, string>();
+        phases.set(itemId, item.phase);
+        this.itemPhasesByTurn.set(key, phases);
+      }
+      return;
+    }
+
+    if (method === "item/agentMessage/delta") {
+      const key = turnKeyFromParams(params);
+      const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!key || !itemId || !delta || this.itemPhasesByTurn.get(key)?.get(itemId) === "commentary") {
+        return;
+      }
+      if (this.turnStreams.has(key)) {
+        this.enqueueTurnEvent(key, { type: "delta", text: delta });
+      } else {
+        this.queueTurnEvent(key, { type: "delta", text: delta });
+      }
+      return;
+    }
+
+    if (method === "item/completed") {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
+      if (!threadId || !turnId) {
+        return;
+      }
+      const key = turnKey(threadId, turnId);
+      this.appendTurnEvent(key, raw);
+      const item = params.item as Record<string, unknown> | undefined;
+      if (item?.type === "agentMessage" && typeof item.text === "string") {
+        if (item.phase === "commentary") {
+          const progress = item.text.trim();
+          if (progress) {
+            if (this.turnStreams.has(key)) {
+              this.enqueueTurnEvent(key, { type: "progress", text: progress });
+            } else {
+              this.queueTurnEvent(key, { type: "progress", text: progress });
+            }
+          }
+        } else {
+          this.turnTexts.set(key, item.text);
+        }
+      }
+      return;
+    }
+
+    if (method !== "turn/completed") {
+      return;
+    }
+    const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+    const turn = params.turn as Record<string, unknown> | undefined;
+    const turnId = typeof turn?.id === "string" ? turn.id : undefined;
+    if (!threadId || !turnId) {
+      return;
+    }
+    const key = turnKey(threadId, turnId);
+    if (this.abandonedTurns.delete(key)) {
+      return;
+    }
+    this.appendTurnEvent(key, raw);
+    const status = typeof turn?.status === "string" ? turn.status : "completed";
+    const errorValue = turn?.error as Record<string, unknown> | undefined;
+    this.settleTurn(threadId, turnId, key, {
+      status,
+      text: this.turnTexts.get(key) ?? extractAgentMessageFromTurn(turn),
+      raw: (this.turnEvents.get(key) ?? []).join("\n"),
+      error: typeof errorValue?.message === "string" ? errorValue.message : undefined
+    });
+  }
+
+  private waitForTurn(threadId: string, turnId: string): Promise<CodexRunResult> {
+    const key = turnKey(threadId, turnId);
+    const completed = this.completedTurns.get(key);
+    if (completed) {
+      this.completedTurns.delete(key);
+      return new Promise((resolve, reject) => {
+        void this.finishTurn(threadId, key, completed, resolve, reject);
+      });
+    }
+
+    return new Promise((resolve, reject) => {
+      this.turnWaiters.set(key, { resolve, reject });
+    });
+  }
+
+  private async finishTurn(
+    threadId: string,
+    key: string,
+    completion: TurnCompletion,
+    resolve: (value: CodexRunResult) => void,
+    reject: (error: Error) => void
+  ): Promise<void> {
+    const stream = this.turnStreams.get(key);
+    this.turnStreams.delete(key);
+    if (stream) {
+      stream.closed = true;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await stream.chain;
+    }
+    this.turnEvents.delete(key);
+    this.turnTexts.delete(key);
+    this.queuedTurnEvents.delete(key);
+    this.itemPhasesByTurn.delete(key);
+    if (completion.status === "completed") {
+      resolve({ text: completion.text, threadId, raw: completion.raw });
+      return;
+    }
+    if (completion.status === "interrupted") {
+      reject(new Error("Codex app-server turn was interrupted"));
+      return;
+    }
+    reject(new Error(completion.error ?? `Codex app-server turn ended with status ${completion.status}`));
+  }
+
+  private appendTurnEvent(key: string, raw: string): void {
+    const events = this.turnEvents.get(key) ?? [];
+    events.push(raw);
+    this.turnEvents.set(key, events);
+  }
+
+  private queueTurnEvent(key: string, event: QueuedTurnEvent): void {
+    const queued = this.queuedTurnEvents.get(key) ?? [];
+    queued.push(event);
+    this.queuedTurnEvents.set(key, queued);
+  }
+
+  private enqueueTurnEvent(key: string, event: QueuedTurnEvent): void {
+    const stream = this.turnStreams.get(key);
+    if (!stream) return;
+    const callback = event.type === "progress" ? stream.onProgress : stream.onDelta;
+    if (!callback) return;
+    if (event.type === "progress") {
+      if (!stream.progressActive) {
+        stream.progressActive = true;
+        stream.progressChain = this.runStreamCallback(callback, event)
+          .catch((error) => {
+            console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);
+          })
+          .finally(() => {
+            stream.progressActive = false;
+          });
+        return;
+      }
+      stream.progressChain = stream.progressChain
+        .then(() => {
+          if (stream.closed) return;
+          return this.runStreamCallback(callback, event);
+        })
+        .catch((error) => {
+          console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      return;
+    }
+    stream.chain = stream.chain
+      .then(() => {
+        return this.runStreamCallback(callback, event);
+      })
+      .then(() => undefined)
+      .catch((error) => {
+        console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+  }
+
+  private handleServerRequest(message: WireMessage): void {
+    const id = message.id as JsonRpcId;
+    const denyAll = this.options.serverRequestPolicy === "deny-all";
+    switch (message.method) {
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+        this.send({ id, result: { decision: denyAll ? "decline" : "acceptForSession" } });
+        return;
+      case "execCommandApproval":
+      case "applyPatchApproval":
+        this.send({ id, result: { decision: denyAll ? "denied" : "approved" } });
+        return;
+      case "item/tool/requestUserInput":
+      case "tool/requestUserInput":
+        this.send({ id, result: { answers: {} } });
+        return;
+      case "mcpServer/elicitation/request":
+        this.send({ id, result: { action: "cancel", content: null, _meta: null } });
+        return;
+      case "item/permissions/requestApproval":
+        if (denyAll) {
+          this.send({ id, error: { code: -32000, message: "Permission escalation denied by client policy" } });
+        } else {
+          this.send({
+            id,
+            result: {
+              permissions: isRecord(message.params?.permissions) ? message.params.permissions : {},
+              scope: "session"
+            }
+          });
+        }
+        return;
+      case "item/tool/call":
+        this.send({
+          id,
+          result: {
+            contentItems: [{ type: "inputText", text: "Dynamic tools are not available in codex-weixin." }],
+            success: false
+          }
+        });
+        return;
+      case "currentTime/read":
+        if (denyAll) {
+          this.send({ id, error: { code: -32601, message: "Tool requests are disabled by client policy" } });
+        } else {
+          this.send({ id, result: { currentTimeAt: Math.floor(Date.now() / 1_000) } });
+        }
+        return;
+      default:
+        this.send({
+          id,
+          error: { code: -32601, message: `Unsupported app-server request: ${message.method ?? "unknown"}` }
+        });
+    }
+  }
+
+  private async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    await this.request("turn/interrupt", { threadId, turnId }, this.interruptTimeoutMs());
+  }
+
+  private async withTurnCancellation(
+    turn: Promise<CodexRunResult>,
+    threadId: string,
+    turnId: string,
+    timeoutMs: number | undefined,
+    signal: AbortSignal | undefined
+  ): Promise<CodexRunResult> {
+    const boundedTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : undefined;
+    if (!boundedTimeout && !signal) return turn;
+
+    let timer: NodeJS.Timeout | undefined;
+    let abortHandler: (() => void) | undefined;
+    let resolveCancellation!: (error: Error) => void;
+    let cancelled = false;
+    const cancellation = new Promise<Error>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    const cancel = (error: Error) => {
+      if (cancelled) return;
+      cancelled = true;
+      resolveCancellation(error);
+    };
+    if (boundedTimeout) {
+      timer = setTimeout(() => {
+        cancel(new Error(`Codex app-server turn timed out after ${boundedTimeout}ms`));
+      }, boundedTimeout);
+      timer.unref();
+    }
+    if (signal) {
+      abortHandler = () => cancel(abortError(signal.reason));
+      if (signal.aborted) abortHandler();
+      else signal.addEventListener("abort", abortHandler, { once: true });
+    }
+    try {
+      const outcome = await Promise.race([
+        turn.then(
+          (result) => ({ type: "turn" as const, result }),
+          (error: unknown) => ({ type: "turn-error" as const, error })
+        ),
+        cancellation.then((error) => ({ type: "cancel" as const, error }))
+      ]);
+      if (outcome.type === "turn") return outcome.result;
+      if (outcome.type === "turn-error") throw outcome.error;
+      try {
+        await this.interruptTurn(threadId, turnId);
+      } catch {
+        // request() tears down an unresponsive transport; preserve the scoped cancellation error.
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      this.abandonTurn(threadId, turnId);
+      throw outcome.error;
+    } finally {
+      clearTimeout(timer);
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+    }
+  }
+
+  private handleChildFailure(child: ChildProcessWithoutNullStreams, error: Error): void {
+    if (this.child !== child) {
+      return;
+    }
+    this.failTransport(error, false);
+  }
+
+  private failTransport(error: Error, kill: boolean): void {
+    const child = this.child;
+    this.child = undefined;
+    this.initialized = false;
+    this.lines?.close();
+    this.lines = undefined;
+    if (kill && child?.exitCode === null) {
+      child.kill();
+    }
+    for (const [id, pending] of this.pending.entries()) {
+      this.pending.delete(id);
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    for (const [key, waiter] of this.turnWaiters.entries()) {
+      this.turnWaiters.delete(key);
+      waiter.reject(error);
+    }
+    this.activeTurns.clear();
+    this.turnEvents.clear();
+    this.turnTexts.clear();
+    this.completedTurns.clear();
+    this.turnStreams.clear();
+    this.clearTurnProbes();
+    this.queuedTurnEvents.clear();
+    this.itemPhasesByTurn.clear();
+    this.abandonedTurns.clear();
+    this.runtimeInfoByThread.clear();
+    this.modelOptions = undefined;
+  }
+
+  private settleTurn(threadId: string, turnId: string, key: string, completion: TurnCompletion): void {
+    if (this.activeTurns.get(threadId) === turnId) {
+      this.activeTurns.delete(threadId);
+    }
+    this.clearTurnProbe(key);
+    const waiter = this.turnWaiters.get(key);
+    if (!waiter) {
+      this.completedTurns.set(key, completion);
+      return;
+    }
+    this.turnWaiters.delete(key);
+    void this.finishTurn(threadId, key, completion, waiter.resolve, waiter.reject);
+  }
+
+  private abandonTurn(threadId: string, turnId: string): void {
+    const key = turnKey(threadId, turnId);
+    if (!this.turnWaiters.has(key) && this.activeTurns.get(threadId) !== turnId) return;
+    this.abandonedTurns.add(key);
+    while (this.abandonedTurns.size > 1_000) {
+      const oldest = this.abandonedTurns.values().next().value as string | undefined;
+      if (!oldest) break;
+      this.abandonedTurns.delete(oldest);
+    }
+    if (this.activeTurns.get(threadId) === turnId) this.activeTurns.delete(threadId);
+    this.clearTurnProbe(key);
+    const waiter = this.turnWaiters.get(key);
+    this.turnWaiters.delete(key);
+    waiter?.reject(new Error("Codex app-server turn was abandoned after cancellation"));
+    const stream = this.turnStreams.get(key);
+    if (stream) stream.closed = true;
+    this.turnStreams.delete(key);
+    this.turnEvents.delete(key);
+    this.turnTexts.delete(key);
+    this.completedTurns.delete(key);
+    this.queuedTurnEvents.delete(key);
+    this.itemPhasesByTurn.delete(key);
+  }
+
+  private beginTurnProbe(threadId: string, turnId: string): void {
+    const timeoutMs = this.turnStallTimeoutMs();
+    if (!timeoutMs) return;
+    const key = turnKey(threadId, turnId);
+    this.turnProbes.set(key, {
+      threadId,
+      turnId,
+      lastActivityAt: Date.now(),
+      probing: false
+    });
+    this.scheduleTurnProbe(key);
+  }
+
+  private touchTurnProbe(key: string): void {
+    const probe = this.turnProbes.get(key);
+    if (!probe) return;
+    probe.lastActivityAt = Date.now();
+    if (!probe.probing) {
+      this.scheduleTurnProbe(key);
+    }
+  }
+
+  private scheduleTurnProbe(key: string): void {
+    const probe = this.turnProbes.get(key);
+    const timeoutMs = this.turnStallTimeoutMs();
+    if (!probe || !timeoutMs) return;
+    clearTimeout(probe.timer);
+    const delayMs = Math.max(1, timeoutMs - (Date.now() - probe.lastActivityAt));
+    probe.timer = setTimeout(() => {
+      void this.probeTurn(key);
+    }, delayMs);
+    probe.timer.unref();
+  }
+
+  private async probeTurn(key: string): Promise<void> {
+    const probe = this.turnProbes.get(key);
+    const timeoutMs = this.turnStallTimeoutMs();
+    if (!probe || !timeoutMs || probe.probing) return;
+    if (Date.now() - probe.lastActivityAt < timeoutMs) {
+      this.scheduleTurnProbe(key);
+      return;
+    }
+
+    probe.probing = true;
+    try {
+      const response = await this.request("thread/read", {
+        threadId: probe.threadId,
+        includeTurns: true
+      }, this.options.turnProbeTimeoutMs ?? 15_000) as Record<string, unknown>;
+      const thread = response.thread as Record<string, unknown> | undefined;
+      const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+      const turn = turns.find((candidate) => {
+        const value = candidate as Record<string, unknown>;
+        return value?.id === probe.turnId;
+      }) as Record<string, unknown> | undefined;
+      if (!turn) {
+        throw new Error("app-server did not report the active turn during a stall probe");
+      }
+      const status = typeof turn.status === "string" ? turn.status : "";
+      if (status === "inProgress" || status === "pending" || status === "queued") {
+        probe.lastActivityAt = Date.now();
+        return;
+      }
+      if (status !== "completed" && status !== "interrupted" && status !== "failed" && status !== "error") {
+        throw new Error(`app-server returned an unknown active turn status: ${status || "missing"}`);
+      }
+      const errorValue = turn.error as Record<string, unknown> | undefined;
+      this.settleTurn(probe.threadId, probe.turnId, key, {
+        status,
+        text: this.turnTexts.get(key) ?? extractAgentMessageFromTurn(turn),
+        raw: (this.turnEvents.get(key) ?? []).join("\n"),
+        error: typeof errorValue?.message === "string" ? errorValue.message : undefined
+      });
+    } catch (error) {
+      if (this.turnProbes.has(key)) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.failTransport(new Error(`app-server turn stream became unresponsive: ${detail}`), true);
+      }
+    } finally {
+      const current = this.turnProbes.get(key);
+      if (current) {
+        current.probing = false;
+        this.scheduleTurnProbe(key);
+      }
+    }
+  }
+
+  private clearTurnProbe(key: string): void {
+    const probe = this.turnProbes.get(key);
+    if (probe) {
+      clearTimeout(probe.timer);
+      this.turnProbes.delete(key);
+    }
+  }
+
+  private clearTurnProbes(): void {
+    for (const probe of this.turnProbes.values()) {
+      clearTimeout(probe.timer);
+    }
+    this.turnProbes.clear();
+  }
+
+  private interruptTimeoutMs(): number {
+    const timeoutMs = this.options.interruptTimeoutMs ?? 5_000;
+    return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5_000;
+  }
+
+  private turnStallTimeoutMs(): number | undefined {
+    const timeoutMs = this.options.turnStallTimeoutMs;
+    return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : undefined;
+  }
+
+  private async runStreamCallback(
+    callback: (text: string) => Promise<void> | void,
+    event: QueuedTurnEvent
+  ): Promise<void> {
+    const timeoutMs = this.options.streamCallbackTimeoutMs ?? 30_000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      await callback(event.text);
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const callbackResult = callback(event.text);
+      await Promise.race([
+        Promise.resolve(callbackResult),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Codex ${event.type} callback timed out after ${timeoutMs}ms`)), timeoutMs);
+          timer.unref();
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function turnKeyFromParams(params: Record<string, unknown>): string | undefined {
+  const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+  const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
+  return threadId && turnId ? turnKey(threadId, turnId) : undefined;
+}
+
+function parseModelOption(value: unknown): CodexModelOption | undefined {
+  const model = value as Record<string, unknown>;
+  const modelId = typeof model.model === "string" && model.model
+    ? model.model
+    : typeof model.id === "string" ? model.id : "";
+  if (!modelId || model.hidden === true) return undefined;
+  const efforts = Array.isArray(model.supportedReasoningEfforts)
+    ? model.supportedReasoningEfforts.flatMap((value) => {
+      const effort = value as Record<string, unknown>;
+      return typeof effort.reasoningEffort === "string" && effort.reasoningEffort
+        ? [{
+          effort: effort.reasoningEffort,
+          description: typeof effort.description === "string" ? effort.description : ""
+        }]
+        : [];
+    })
+    : [];
+  return {
+    model: modelId,
+    displayName: typeof model.displayName === "string" && model.displayName ? model.displayName : modelId,
+    description: typeof model.description === "string" ? model.description : "",
+    isDefault: model.isDefault === true,
+    ...(typeof model.defaultReasoningEffort === "string" && model.defaultReasoningEffort
+      ? { defaultEffort: model.defaultReasoningEffort }
+      : {}),
+    supportedEfforts: efforts
+  };
+}
+
+function runtimeInfoFromThreadResponse(response: Record<string, unknown>): CodexRuntimeInfo {
+  return compactRuntimeInfo({
+    model: response.model,
+    effort: response.reasoningEffort,
+    provider: response.modelProvider ?? response.model_provider
+  });
+}
+
+function compactRuntimeInfo(input: { model?: unknown; effort?: unknown; provider?: unknown }): CodexRuntimeInfo {
+  return {
+    ...(typeof input.model === "string" && input.model ? { model: input.model } : {}),
+    ...(typeof input.effort === "string" && input.effort ? { effort: input.effort } : {}),
+    ...(typeof input.provider === "string" && input.provider ? { provider: input.provider } : {})
+  };
+}
+
+function compactObject(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+}
+
+function serializeIsolationPolicy(policy: CodexRestrictedReadOnlySandboxPolicy | undefined): {
+  threadStart: Record<string, unknown>;
+  threadResume: Record<string, unknown>;
+  turn: Record<string, unknown>;
+} {
+  if (!policy) return { threadStart: {}, threadResume: {}, turn: {} };
+  const permissionProfile = typeof policy.permissionProfile === "string" ? policy.permissionProfile.trim() : "";
+  if (!permissionProfile || permissionProfile.length > 128) {
+    throw new Error("restricted read-only sandboxPolicy requires a valid permissionProfile");
+  }
+  if (policy.type !== "readOnly"
+    || policy.networkAccess !== false
+    || policy.access?.type !== "restricted"
+    || policy.access.includePlatformDefaults !== false
+    || !Array.isArray(policy.access.readableRoots)
+    || policy.access.readableRoots.length === 0
+    || policy.access.readableRoots.some((root) => typeof root !== "string" || !path.isAbsolute(root))) {
+    throw new Error("invalid restricted read-only sandboxPolicy");
+  }
+  const readableRoots = [...new Set(policy.access.readableRoots.map((root) => path.resolve(root)))];
+  return {
+    threadStart: {
+      permissions: permissionProfile,
+      runtimeWorkspaceRoots: readableRoots,
+      environments: [],
+      dynamicTools: [],
+      selectedCapabilityRoots: []
+    },
+    threadResume: {
+      permissions: permissionProfile,
+      runtimeWorkspaceRoots: readableRoots
+    },
+    turn: {
+      permissions: permissionProfile,
+      runtimeWorkspaceRoots: readableRoots,
+      environments: []
+    }
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function abortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  return new Error("Codex app-server turn was aborted");
+}
+
+function turnKey(threadId: string, turnId: string): string {
+  return `${threadId}\u0000${turnId}`;
+}
+
+function extractAgentMessageFromTurn(turn: Record<string, unknown> | undefined): string {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index] as Record<string, unknown>;
+    if (item?.type === "agentMessage" && typeof item.text === "string") {
+      return item.text;
+    }
+  }
+  return "";
+}
+
+export function parseThreadHistory(thread: Record<string, unknown> | undefined): CodexHistoryMessage[] {
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const messages: CodexHistoryMessage[] = [];
+  for (const rawTurn of turns) {
+    const turn = rawTurn as Record<string, unknown>;
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    const userCreatedAt = unixSecondsToIso(turn.startedAt);
+    const assistantCreatedAt = unixSecondsToIso(turn.completedAt ?? turn.startedAt);
+    for (const rawItem of items) {
+      const item = rawItem as Record<string, unknown>;
+      const id = typeof item.id === "string" ? item.id : `${String(turn.id ?? "turn")}:${messages.length}`;
+      if (item.type === "userMessage") {
+        const text = extractUserMessageText(item.content);
+        if (text) {
+          messages.push({ id, role: "user", text, ...(userCreatedAt ? { createdAt: userCreatedAt } : {}) });
+        }
+        continue;
+      }
+      if (
+        item.type === "agentMessage"
+        && typeof item.text === "string"
+        && item.text.trim()
+      ) {
+        messages.push({
+          id,
+          role: "assistant",
+          text: item.text.trim(),
+          ...(item.phase === "commentary" ? { kind: "progress" as const } : {}),
+          ...(assistantCreatedAt ? { createdAt: assistantCreatedAt } : {})
+        });
+      }
+    }
+  }
+  return messages;
+}
+
+function extractUserMessageText(value: unknown): string {
+  if (!Array.isArray(value)) {
+    return "";
+  }
+  return value.map((raw) => {
+    const item = raw as Record<string, unknown>;
+    if (item.type === "text" && typeof item.text === "string") {
+      return item.text;
+    }
+    if (item.type === "localImage" && typeof item.path === "string") {
+      return `[本机图片: ${item.path}]`;
+    }
+    if (item.type === "image" && typeof item.url === "string") {
+      return `[图片: ${item.url}]`;
+    }
+    return "";
+  }).filter(Boolean).join("\n").trim();
+}
+
+function unixSecondsToIso(value: unknown): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return new Date(value * 1_000).toISOString();
+}

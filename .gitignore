@@ -1,8 +1,20 @@
 node_modules/
-.env*
+dist/
+coverage/
+output/
+.playwright-cli/
+.env
+.codex-weixin/
 *.log
+*.tsbuildinfo
+
+# Local HR data and credentials
 hr.json
 hr-web.json
 hr-ai.json
 hr-materials/
 hr-codex-runtime/
+
+# Cloudflare local state
+.wrangler/
+.dev.vars

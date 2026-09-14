@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>微信扫码 HR ClawBot</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/vendor/lucide.min.js"></script>
+  <script defer src="/vendor/marked.umd.js"></script>
+  <script defer src="/vendor/purify.min.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="brand" href="#opportunities" aria-label="HR ClawBot 首页">
+        <span class="brand-mark" aria-hidden="true">
+          <i data-lucide="briefcase"></i>
+          <i data-lucide="message-circle"></i>
+        </span>
+        <span class="brand-name">HR ClawBot</span>
+        <span class="brand-version" id="productVersion" aria-label="HR ClawBot 版本" hidden></span>
+      </a>
+      <nav class="view-tabs" aria-label="管理视图">
+        <button class="tab is-active" type="button" data-view="opportunities">机会</button>
+        <button class="tab" type="button" data-view="wecom">扫码入口</button>
+      </nav>
+      <div class="header-actions">
+        <button class="button button-primary header-action" id="headerHrEntryButton" type="button" data-view="wecom">
+          <i data-lucide="qr-code"></i>
+          <span>入口设置</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="status-band" aria-label="服务概览">
+      <div class="status-inner">
+        <div class="service-state"><span class="pulse-dot" id="serviceDot"></span><span id="serviceStateText">正在检查 HR 助理</span></div>
+        <dl class="metrics">
+          <div><dt>微信扫码入口</dt><dd id="hrEntryMetric">检查中</dd></div>
+          <div><dt>招聘机会</dt><dd id="hrOpportunityMetric">0</dd></div>
+          <div><dt>待确认</dt><dd id="hrPendingMetric">0</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="view opportunities-view is-visible" id="opportunitiesView" data-view-panel="opportunities">
+      <div class="section-heading opportunity-heading">
+        <div>
+          <p class="eyebrow">HR OPPORTUNITIES</p>
+          <h1>招聘机会</h1>
+        </div>
+        <div class="opportunity-heading-actions">
+          <button class="button button-secondary" id="openHrSettingsButton" type="button" data-view="wecom">
+            <i data-lucide="settings-2"></i>
+            <span>扫码入口</span>
+          </button>
+          <button class="icon-button" id="refreshOpportunitiesButton" type="button" title="刷新招聘机会" aria-label="刷新招聘机会">
+            <i data-lucide="refresh-cw"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="opportunity-summary" id="opportunitySummary" aria-label="招聘机会概览">
+        <div><span>全部机会</span><strong id="opportunityTotalMetric">0</strong></div>
+        <div><span>高优先级</span><strong id="opportunityHighMetric">0</strong></div>
+        <div><span>待确认</span><strong id="opportunityPendingMetric">0</strong></div>
+        <div><span>今日更新</span><strong id="opportunityTodayMetric">0</strong></div>
+      </div>
+
+      <div class="opportunity-toolbar">
+        <div class="opportunity-filters" id="opportunityFilters" aria-label="机会筛选">
+          <button class="is-active" type="button" data-opportunity-filter="all">全部</button>
+          <button type="button" data-opportunity-filter="high">高优先级</button>
+          <button type="button" data-opportunity-filter="pending">待确认</button>
+          <button type="button" data-opportunity-filter="active">沟通中</button>
+        </div>
+        <label class="opportunity-search" for="opportunitySearchInput">
+          <i data-lucide="search"></i>
+          <span class="sr-only">搜索招聘机会</span>
+          <input id="opportunitySearchInput" type="search" autocomplete="off" placeholder="搜索公司、岗位或关注点">
+        </label>
+      </div>
+      <div class="opportunity-list" id="opportunitiesList" aria-live="polite">
+        <div class="opportunity-loading"><span class="spinner" aria-hidden="true"></span><strong>正在读取招聘机会</strong></div>
+      </div>
+    </section>
+
+    <section class="view wecom-view" id="wecomView" data-view-panel="wecom" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">WECHAT WEB ACCESS</p>
+          <h1>微信扫码入口</h1>
+        </div>
+        <button class="icon-button" id="refreshHrSettingsButton" type="button" title="刷新接入状态" aria-label="刷新接入状态">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </div>
+
+      <details class="hr-entry-panel" id="hrEntryPanel" open>
+        <summary>
+          <span class="hr-entry-summary-icon" aria-hidden="true"><i data-lucide="message-square-more"></i></span>
+          <span class="hr-entry-summary-copy">
+            <strong>H5 招聘对话入口</strong>
+            <small id="hrEntrySummaryText">正在读取接入状态</small>
+          </span>
+          <span class="hr-entry-status" id="hrEntryStatus">检查中</span>
+          <i class="hr-entry-chevron" data-lucide="chevron-down"></i>
+        </summary>
+        <div class="hr-entry-content">
+          <form class="hr-settings-form" id="hrSettingsForm">
+            <div class="hr-settings-heading">
+              <div>
+                <h2>访客接待</h2>
+                <p>HR 用微信扫码打开独立访客页；本机管理后台不会对外开放。</p>
+              </div>
+              <label class="toggle-field hr-enabled-toggle" for="hrEnabledInput">
+                <span>启用接待</span>
+                <span class="toggle-control">
+                  <input id="hrEnabledInput" name="enabled" type="checkbox">
+                  <span aria-hidden="true"></span>
+                </span>
+              </label>
+            </div>
+
+            <div class="hr-endpoint-list" aria-label="访客服务地址">
+              <div>
+                <span>访客服务监听地址</span>
+                <strong id="hrPublicListenerTarget">http://127.0.0.1:8789</strong>
+                <button class="icon-button" id="copyHrPublicListenerButton" type="button" title="复制访客服务监听地址" aria-label="复制访客服务监听地址">
+                  <i data-lucide="copy"></i>
+                </button>
+              </div>
+              <div>
+                <span>当前入口类型</span>
+                <strong id="hrReachability">正在检查</strong>
+                <span class="hr-entry-status" id="hrReachabilityStatus">检查中</span>
+              </div>
+            </div>
+
+            <div class="hr-settings-fields">
+              <label>
+                <span>候选人显示名称</span>
+                <input id="hrCandidateNameInput" name="candidateName" autocomplete="name" placeholder="例如：宋先生">
+              </label>
+              <label class="hr-field-wide">
+                <span>公网 HTTPS 基址</span>
+                <input id="hrPublicBaseUrlInput" name="publicBaseUrl" type="url" autocomplete="url" placeholder="https://你的域名">
+                <small class="field-hint">留空时生成同一局域网可访问的测试二维码；长期对外使用时填写指向 8789 访客服务的固定 HTTPS 域名。8787 后台始终只在本机开放。</small>
+              </label>
+            </div>
+            <div class="hr-settings-actions">
+              <p><i data-lucide="shield-check"></i><span>每位扫码访客获得独立会话；同意前不会保存聊天正文或开放简历。</span></p>
+              <div class="hr-setting-button-group">
+                <button class="button button-secondary" id="rotateHrEntryButton" type="button" title="更换二维码密钥">
+                  <i data-lucide="key-round"></i><span>更换二维码</span>
+                </button>
+                <button class="button button-primary" id="saveHrSettingsButton" type="submit">
+                  <i data-lucide="save"></i><span>保存入口设置</span>
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <aside class="hr-entry-qr" aria-label="长期招聘入口">
+            <div class="hr-entry-qr-heading">
+              <div>
+                <span>唯一访客入口</span>
+                <strong id="hrEntryStableId">尚未生成</strong>
+              </div>
+              <span class="hr-entry-permanent"><i data-lucide="link-2"></i>固定二维码</span>
+            </div>
+            <div class="hr-entry-qr-frame" id="hrEntryQrFrame">
+              <span><i data-lucide="qr-code"></i></span>
+              <small>启用访客接待后即可扫码</small>
+            </div>
+            <div class="hr-entry-link-row">
+              <span id="hrEntryPublicLink">等待接入信息</span>
+              <button class="icon-button" id="copyHrEntryLinkButton" type="button" title="复制固定访客链接" aria-label="复制固定访客链接" disabled>
+                <i data-lucide="copy"></i>
+              </button>
+            </div>
+            <p id="hrEntryValidityNote">二维码保持不变；只有主动更换密钥时才会生成新入口。</p>
+          </aside>
+        </div>
+      </details>
+
+      <section class="hr-ai-section" aria-labelledby="hrAiTitle">
+        <form class="hr-ai-form" id="hrAiSettingsForm">
+          <div class="hr-settings-heading">
+            <div>
+              <p class="eyebrow">CODEX RUNTIME</p>
+              <h2 id="hrAiTitle">Codex 接待</h2>
+              <p>本机 Codex 是访客回答主引擎；下方 Responses API 仅作为可选备用。</p>
+            </div>
+            <div class="hr-ai-heading-actions">
+              <span class="hr-entry-status" id="hrAiStatus">检查中</span>
+              <label class="toggle-field hr-enabled-toggle" for="hrAiEnabledInput">
+                <span>启用备用</span>
+                <span class="toggle-control">
+                  <input id="hrAiEnabledInput" name="enabled" type="checkbox">
+                  <span aria-hidden="true"></span>
+                </span>
+              </label>
+            </div>
+          </div>
+          <div class="hr-settings-fields">
+            <label class="hr-field-wide">
+              <span>备用 Responses API HTTPS 端点</span>
+              <input id="hrAiEndpointInput" name="endpoint" type="url" autocomplete="url" placeholder="https://api.openai.com/v1/responses">
+            </label>
+            <label>
+              <span>备用模型</span>
+              <input id="hrAiModelInput" name="model" autocomplete="off" placeholder="例如：gpt-5-mini">
+            </label>
+            <label>
+              <span class="hr-credential-label">备用 API Key <small id="hrAiApiKeyStatus">未配置</small></span>
+              <input id="hrAiApiKeyInput" name="apiKey" type="password" autocomplete="new-password" placeholder="输入后加密保存">
+            </label>
+          </div>
+          <div class="hr-ai-safety" id="hrAiSafety">
+            <span><i data-lucide="shield-check"></i><strong>无工具隔离</strong> Codex 不获得终端、文件或外部操作工具</span>
+            <span><i data-lucide="folder-lock"></i><strong>受限检索</strong> 仅发送命中的 PDF、DOCX 与文本摘录</span>
+            <span><i data-lucide="user-check"></i><strong>承诺保护</strong> 面试、Offer 与入职条件必须由你确认</span>
+          </div>
+          <div class="hr-settings-actions">
+            <p id="hrAiStatusDetail"><i data-lucide="info"></i><span>正在读取 AI 状态</span></p>
+            <button class="button button-primary" id="saveHrAiSettingsButton" type="submit">
+              <i data-lucide="save"></i><span>保存备用设置</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section class="hr-consent-flow" aria-labelledby="hrConsentFlowTitle">
+        <div class="hr-consent-flow-heading">
+          <p class="eyebrow">VISITOR CONSENT</p>
+          <h2 id="hrConsentFlowTitle">HR 首次接待流程</h2>
+        </div>
+        <ol>
+          <li><span>1</span><div><strong>微信扫码进入</strong><small>HR 通过唯一固定二维码打开招聘对话页</small></div></li>
+          <li><span>2</span><div><strong>说明 AI 与记录用途</strong><small>首条消息仅发送文字和同意菜单，不直接推送文件</small></div></li>
+          <li><span>3</span><div><strong>点击同意并获取简历</strong><small>对方确认后进入资料发送流程</small></div></li>
+          <li><span>4</span><div><strong>发送简介和 PDF</strong><small>ClawBot 发送个人简介与原始简历 PDF</small></div></li>
+        </ol>
+      </section>
+
+      <section class="hr-materials-section" aria-labelledby="hrMaterialsTitle">
+        <div class="hr-materials-heading">
+          <div>
+            <p class="eyebrow">PUBLIC PROFILE</p>
+            <h2 id="hrMaterialsTitle">对外资料</h2>
+          </div>
+          <span class="hr-materials-support" id="hrMaterialsSupport">正在读取</span>
+        </div>
+        <form id="hrMaterialsForm" class="hr-materials-form">
+          <label class="hr-field-wide">
+            <span>AI 身份与记录用途说明</span>
+            <textarea id="hrDisclosureInput" rows="4" maxlength="1024" placeholder="向 HR 说明这是 AI 助理，以及聊天记录的保存和使用方式"></textarea>
+          </label>
+          <label class="hr-field-wide">
+            <span>个人简介</span>
+            <textarea id="hrBioInput" rows="5" maxlength="2048" placeholder="用于首次介绍和回答基本背景问题"></textarea>
+          </label>
+          <label>
+            <span>目标岗位</span>
+            <textarea id="hrTargetRolesInput" rows="3" maxlength="2000" placeholder="每行一个，例如：AI 产品经理"></textarea>
+          </label>
+          <label>
+            <span>个人关键词</span>
+            <textarea id="hrProfileKeywordsInput" rows="3" maxlength="3000" placeholder="每行一个，例如：企业 AI 落地"></textarea>
+          </label>
+          <div class="hr-upload-field">
+            <span class="hr-upload-label">原始简历 PDF</span>
+            <input class="sr-only" id="hrResumeFileInput" type="file" accept=".pdf,application/pdf">
+            <div class="hr-upload-control">
+              <button class="button button-secondary" id="selectHrResumeButton" type="button">
+                <i data-lucide="upload"></i><span>选择 PDF</span>
+              </button>
+              <small id="hrResumeUploadState" aria-live="polite">未选择文件</small>
+            </div>
+          </div>
+          <div class="hr-upload-field">
+            <span class="hr-upload-label">知识库文件</span>
+            <input class="sr-only" id="hrKnowledgeFilesInput" type="file" multiple accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown">
+            <div class="hr-upload-control">
+              <button class="button button-secondary" id="selectHrKnowledgeButton" type="button">
+                <i data-lucide="files"></i><span>选择资料</span>
+              </button>
+              <small id="hrKnowledgeUploadState" aria-live="polite">支持 PDF、DOCX、TXT、MD</small>
+            </div>
+          </div>
+          <details class="hr-advanced-paths hr-field-wide">
+            <summary>高级：使用本机路径</summary>
+            <div class="hr-advanced-path-fields">
+              <label>
+                <span>本机原始简历 PDF 路径</span>
+                <input id="hrResumePathInput" autocomplete="off" placeholder="D:\资料\原始简历.pdf">
+                <small class="field-hint">导入后生成只读归档版本；保存成功后不再回显本机路径。</small>
+              </label>
+              <label>
+                <span>知识库路径</span>
+                <textarea id="hrKnowledgeBasePathsInput" rows="4" placeholder="每行一个本机文件或目录路径"></textarea>
+                <small class="field-hint">留空时保留现有知识库；支持可搜索 PDF、DOCX 和受限 UTF-8 文本。旧版 .doc 请先另存为 .docx。</small>
+              </label>
+            </div>
+          </details>
+          <label class="toggle-field hr-field-wide hr-clear-knowledge" for="hrClearKnowledgeInput">
+            <span><strong>清空知识库清单</strong><small>保存时移除全部已配置路径，不会删除本机原文件</small></span>
+            <span class="toggle-control">
+              <input id="hrClearKnowledgeInput" type="checkbox">
+              <span aria-hidden="true"></span>
+            </span>
+          </label>
+          <div class="hr-material-status" id="hrResumeStatus">
+            <span class="hr-material-icon"><i data-lucide="file-text"></i></span>
+            <span><strong>原始简历 PDF</strong><small>等待资料状态</small></span>
+            <a class="button button-secondary" id="hrResumeLink" href="#" target="_blank" rel="noopener noreferrer" hidden>
+              <i data-lucide="external-link"></i><span>查看原件</span>
+            </a>
+          </div>
+          <div class="hr-material-status" id="hrKnowledgeStatus">
+            <span class="hr-material-icon"><i data-lucide="book-open"></i></span>
+            <span><strong>回答知识库</strong><small>等待资料状态</small></span>
+            <span class="hr-material-badge">待配置</span>
+          </div>
+          <div class="hr-materials-actions">
+            <p id="hrMaterialsHint">资料保存接口尚未启用时，这些内容仅供查看。</p>
+            <button class="button button-primary" id="saveHrMaterialsButton" type="submit" disabled>
+              <i data-lucide="save"></i><span>保存对外资料</span>
+            </button>
+          </div>
+        </form>
+      </section>
+    </section>
+
+  </main>
+
+  <dialog class="modal opportunity-dialog" id="opportunityDialog" aria-labelledby="opportunityDialogTitle">
+    <div class="modal-header opportunity-dialog-header">
+      <div>
+        <p class="eyebrow" id="opportunityDialogCompany">RECRUITING OPPORTUNITY</p>
+        <h2 id="opportunityDialogTitle">招聘机会</h2>
+        <p class="opportunity-dialog-context" id="opportunityDialogContext"></p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog="opportunityDialog" title="关闭" aria-label="关闭机会详情">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+    <div class="opportunity-dialog-body" id="opportunityDetailBody">
+      <div class="opportunity-detail-loading"><span class="spinner" aria-hidden="true"></span><strong>正在读取机会详情</strong></div>
+    </div>
+    <div class="modal-footer opportunity-dialog-footer">
+      <span id="opportunityDialogUpdated">聊天记录由系统自动存档</span>
+      <button class="button button-secondary" type="button" data-close-dialog="opportunityDialog">关闭</button>
+    </div>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+</body>
+</html>
