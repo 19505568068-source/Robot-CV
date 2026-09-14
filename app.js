@@ -345,9 +345,13 @@ async function api(url, options = {}) {
     credentials: "same-origin",
     body: options.body ? JSON.stringify(options.body) : undefined
   });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(payload.error || `请求失败 (${response.status})`);
+  const isJson = (response.headers.get("content-type") || "").includes("application/json");
+  const payload = isJson ? await response.json().catch(() => ({})) : {};
+  if (!response.ok || !isJson) {
+    const fallbackMessage = isJson
+      ? `请求失败 (${response.status})`
+      : "访客服务尚未连接，请稍后再试。";
+    const error = new Error(payload.error || fallbackMessage);
     error.status = response.status;
     error.code = payload.code;
     throw error;
