@@ -37,7 +37,7 @@
     "NOTICE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run copy:web",
+    "build": "tsc -p tsconfig.json && node scripts/copy-web-assets.mjs",
     "copy:web": "node scripts/copy-web-assets.mjs",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "tsx src/server/index.ts",
